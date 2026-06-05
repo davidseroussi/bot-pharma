@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import http.cookiejar
 import json
 import os
 import smtplib
@@ -9,11 +10,12 @@ from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import HTTPCookieProcessor, HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 BASE_URL = "https://www.ocp-pharmalia.fr"
+HOME_URL = f"{BASE_URL}/ocp-pharmacien/"
 DEFAULT_CACHE = ".ocp-product-cache.json"
 DEFAULT_ENV = ".env"
 DEFAULT_NOTIFY_STATE = ".ocp-notification-state.json"
@@ -141,6 +143,179 @@ def build_cookie_header():
     return f"ocp-auth-pharmacien={auth_cookie}"
 
 
+def cookie_header_to_jar(cookie_header):
+    jar = http.cookiejar.CookieJar()
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+
+        domain = ".ocp-pharmalia.fr" if name.startswith(("visid_", "nlbi_", "incap_")) else "www.ocp-pharmalia.fr"
+        if name in ("remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d", "otp_pharmacien", "pharmalia_session"):
+            domain = "sso.ocp-pharmalia.fr"
+
+        jar.set_cookie(
+            http.cookiejar.Cookie(
+                version=0,
+                name=name,
+                value=value,
+                port=None,
+                port_specified=False,
+                domain=domain,
+                domain_specified=True,
+                domain_initial_dot=domain.startswith("."),
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={"HttpOnly": None},
+                rfc2109=False,
+            )
+        )
+    return jar
+
+
+def cookie_matches_host(cookie, host):
+    domain = cookie.domain.lstrip(".")
+    return host == domain or host.endswith(f".{domain}")
+
+
+def cookie_jar_header_for_host(jar, host):
+    selected = {}
+    for cookie in jar:
+        if not cookie_matches_host(cookie, host):
+            continue
+        current = selected.get(cookie.name)
+        if not current or cookie.domain == host:
+            selected[cookie.name] = cookie
+
+    cookies = [f"{cookie.name}={cookie.value}" for cookie in selected.values()]
+    return "; ".join(cookies)
+
+
+def cookie_jar_header_for_env(jar):
+    selected = {}
+    for cookie in jar:
+        if "ocp-pharmalia.fr" not in cookie.domain:
+            continue
+        if cookie.name.startswith("mod_auth_openidc_state_"):
+            continue
+        if cookie.name == "ocp-auth-pharmacien" and not cookie_matches_host(cookie, "www.ocp-pharmalia.fr"):
+            continue
+
+        current = selected.get(cookie.name)
+        if not current or cookie.domain in ("www.ocp-pharmalia.fr", "sso.ocp-pharmalia.fr"):
+            selected[cookie.name] = cookie
+
+    cookies = [f"{cookie.name}={cookie.value}" for cookie in selected.values()]
+    return "; ".join(cookies)
+
+
+def update_env_value(path, key, value):
+    if not path.exists():
+        path.write_text(f"{key}='{value}'\n", encoding="utf-8")
+        return
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    updated = False
+    output = []
+    for line in lines:
+        stripped = line.strip()
+        lhs = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
+        normalized_lhs = lhs[len("export ") :].strip() if lhs.startswith("export ") else lhs
+        if normalized_lhs == key:
+            prefix = "export " if lhs.startswith("export ") else ""
+            output.append(f"{prefix}{key}='{value}'")
+            updated = True
+        else:
+            output.append(line)
+
+    if not updated:
+        output.append(f"{key}='{value}'")
+
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def request_no_redirect(opener, url, headers=None):
+    request = Request(url, headers=headers or {})
+    try:
+        return opener.open(request, timeout=30)
+    except HTTPError as exc:
+        if exc.code in (301, 302, 303, 307, 308):
+            return exc
+        raise
+
+
+def refresh_cookie(cookie_header, env_path=None):
+    jar = cookie_header_to_jar(cookie_header)
+    opener = build_opener(HTTPCookieProcessor(jar), NoRedirectHandler)
+    headers = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        ),
+    }
+
+    first = request_no_redirect(opener, HOME_URL, headers=headers)
+    if first.code == 200:
+        env_cookie_header = cookie_jar_header_for_env(jar)
+        api_cookie_header = cookie_jar_header_for_host(jar, "www.ocp-pharmalia.fr")
+        if api_cookie_header:
+            return env_cookie_header, api_cookie_header
+        raise RuntimeError("Refresh inutile, home deja accessible mais cookie jar vide.")
+    if first.code != 302:
+        raise RuntimeError(f"Refresh OAuth inattendu: /ocp-pharmacien/ a retourne HTTP {first.code}")
+
+    authorize_url = first.headers.get("Location")
+    if not authorize_url:
+        raise RuntimeError("Refresh OAuth impossible: redirect SSO sans Location.")
+
+    second = request_no_redirect(opener, authorize_url, headers=headers)
+    if second.code != 302:
+        raise RuntimeError(
+            "Refresh OAuth impossible: le SSO n'a pas renvoye le callback. "
+            "Il manque probablement les cookies SSO persistants dans OCP_COOKIE."
+        )
+
+    callback_url = second.headers.get("Location")
+    if not callback_url:
+        raise RuntimeError("Refresh OAuth impossible: reponse SSO sans Location callback.")
+
+    parsed = urlparse(callback_url)
+    if parsed.netloc != "www.ocp-pharmalia.fr" or "/oauth2callback" not in parsed.path:
+        raise RuntimeError(f"Refresh OAuth impossible: callback inattendu {callback_url}")
+
+    third = request_no_redirect(opener, callback_url, headers=headers)
+    if third.code not in (200, 302):
+        raise RuntimeError(f"Refresh OAuth callback inattendu: HTTP {third.code}")
+
+    env_cookie_header = cookie_jar_header_for_env(jar)
+    api_cookie_header = cookie_jar_header_for_host(jar, "www.ocp-pharmalia.fr")
+    if "ocp-auth-pharmacien=" not in api_cookie_header:
+        raise RuntimeError("Refresh OAuth termine mais aucun nouveau ocp-auth-pharmacien n'a ete capture.")
+
+    if env_path:
+        update_env_value(Path(env_path), "OCP_COOKIE", env_cookie_header)
+
+    return env_cookie_header, api_cookie_header
+
+
 def email_config():
     host = os.environ.get("SMTP_HOST")
     user = os.environ.get("SMTP_USER")
@@ -190,6 +365,10 @@ def login_smtp(smtp, config):
         smtp.login(config["user"], config["password"])
 
 
+class AuthExpiredError(RuntimeError):
+    pass
+
+
 def request_json(url, cookie_header, accept="application/json, text/javascript, */*; q=0.01", referer=None):
     headers = {
         "accept": accept,
@@ -213,6 +392,8 @@ def request_json(url, cookie_header, accept="application/json, text/javascript, 
             content_type = response.headers.get("content-type", "")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
+        if exc.code == 401:
+            raise AuthExpiredError(f"HTTP 401 sur {url}\n{detail}") from exc
         raise RuntimeError(f"HTTP {exc.code} sur {url}\n{detail}") from exc
     except URLError as exc:
         raise RuntimeError(f"Erreur reseau sur {url}: {exc.reason}") from exc
@@ -224,7 +405,33 @@ def request_json(url, cookie_header, accept="application/json, text/javascript, 
     return json.loads(body)
 
 
-def search_product(cip, cookie):
+class OcpClient:
+    def __init__(self, cookie_header, env_path=None, auto_refresh=True):
+        self.full_cookie_header = cookie_header
+        self.cookie_header = cookie_jar_header_for_host(
+            cookie_header_to_jar(cookie_header),
+            "www.ocp-pharmalia.fr",
+        ) or cookie_header
+        self.env_path = env_path
+        self.auto_refresh = auto_refresh
+
+    def request_json(self, url, accept="application/json, text/javascript, */*; q=0.01", referer=None):
+        try:
+            return request_json(url, self.cookie_header, accept=accept, referer=referer)
+        except AuthExpiredError:
+            if not self.auto_refresh:
+                raise
+
+            print("Token OCP expire, tentative de refresh OAuth...", file=sys.stderr, flush=True)
+            self.full_cookie_header, self.cookie_header = refresh_cookie(
+                self.full_cookie_header,
+                self.env_path,
+            )
+            print("Token OCP rafraichi.", file=sys.stderr, flush=True)
+            return request_json(url, self.cookie_header, accept=accept, referer=referer)
+
+
+def search_product(cip, client):
     query = urlencode(
         {
             "type": "Produits",
@@ -237,7 +444,7 @@ def search_product(cip, cookie):
     )
     url = f"{BASE_URL}/ocp-back/recherche?{query}"
     referer = f"{BASE_URL}/ocp-pharmacien/resultat-recherche/Produits/0/{quote(cip)}?customVarsSiteSrc=2"
-    data = request_json(url, cookie, referer=referer)
+    data = client.request_json(url, referer=referer)
     hits = data.get("hits") or []
     if not hits:
         raise RuntimeError(f"Aucun produit trouve pour CIP {cip}")
@@ -288,14 +495,13 @@ def availability_from_item(item):
     }
 
 
-def check_availability_group(products, cookie, quantity):
+def check_availability_group(products, client, quantity):
     referer = (
         f"{BASE_URL}/ocp-pharmacien/resultat-recherche/Produits/0/"
         f"{quote(products[0]['cip'])}?customVarsSiteSrc=2"
     )
-    data = request_json(
+    data = client.request_json(
         availability_url(products, quantity),
-        cookie,
         accept="*/*",
         referer=referer,
     )
@@ -406,22 +612,22 @@ def maybe_notify(product, availability, notify_state, notify_config, notify_enab
     print(f"Mail envoye pour {cip} -> {notify_config['to_addr']}", flush=True)
 
 
-def get_product(cip, cookie, cache_path, refresh_cache):
+def get_product(cip, client, cache_path, refresh_cache):
     cache = load_cache(cache_path)
     if not refresh_cache and cip in cache:
         return cache[cip]
 
-    product = search_product(cip, cookie)
+    product = search_product(cip, client)
     cache[cip] = product
     save_cache(cache_path, cache)
     return product
 
 
-def load_products(cips, cookie_header, cache_path, refresh_cache):
+def load_products(cips, client, cache_path, refresh_cache):
     products = []
     for cip in cips:
         try:
-            product = get_product(cip, cookie_header, cache_path, refresh_cache)
+            product = get_product(cip, client, cache_path, refresh_cache)
         except Exception as exc:
             print(f"Erreur recherche {cip}: {exc}", file=sys.stderr, flush=True)
             continue
@@ -446,7 +652,7 @@ def product_groups(products):
 
 def check_products(
     products,
-    cookie_header,
+    client,
     quantity,
     show_json,
     notify_state,
@@ -456,7 +662,7 @@ def check_products(
     ok = 0
     for group in product_groups(products):
         try:
-            availabilities = check_availability_group(group, cookie_header, quantity)
+            availabilities = check_availability_group(group, client, quantity)
         except Exception as exc:
             cips = ", ".join(product["cip"] for product in group)
             print(f"Erreur disponibilite {cips}: {exc}", file=sys.stderr, flush=True)
@@ -531,6 +737,11 @@ def main():
         action="store_true",
         help="Desactive l'envoi de mail meme si un produit est disponible.",
     )
+    parser.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Desactive la tentative de refresh OAuth automatique apres un 401.",
+    )
     args = parser.parse_args()
 
     input_cips = args.cip or WATCH_CIPS
@@ -557,15 +768,16 @@ def main():
     notify_state_path = Path(args.notify_state)
     notify_state = load_json_file(notify_state_path, {})
     notify_config = email_config()
+    client = OcpClient(cookie_header, env_path=args.env, auto_refresh=not args.no_refresh)
     try:
-        products = load_products(cips, cookie_header, cache_path, args.refresh_cache)
+        products = load_products(cips, client, cache_path, args.refresh_cache)
         if not products:
             return 1
 
         while True:
             ok = check_products(
                 products,
-                cookie_header,
+                client,
                 args.quantity,
                 args.json,
                 notify_state,

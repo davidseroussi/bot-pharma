@@ -1,0 +1,6 @@
+.env
+.ocp-product-cache.json
+.ocp-product-cache.json.tmp
+.ocp-notification-state.json
+.ocp-notification-state.json.tmp
+__pycache__/
