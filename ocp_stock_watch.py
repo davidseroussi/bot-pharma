@@ -21,34 +21,34 @@ DEFAULT_ENV = ".env"
 DEFAULT_NOTIFY_STATE = ".ocp-notification-state.json"
 WATCH_CIPS = [
     "3400926630294",
-    "3400930179734",
-    "3400926929992",
-    "3400928022127",
-    "3400930187050",
-    "3400936757509",
-    "3400936895744",
-    "3400936424722",
-    "3400930056202",
-    "3400937746243",
-    "3400930070604",
-    "3400927623004",
-    "3400930174968",
-    "3400935651518",
-    "3400932172146",
-    "3400937680554",
-    "3400934830167",
-    "3400939536057",
-    "3400930187159",
-    "3400949335107",
-    "3400930014066",
-    "3400930014035",
-    "3400930013984",
-    "3400930013953",
-    "3400936005167",
-    "3400938307658",
-    "3400930079782",
-    "3400931710509",
-    "3400936215993",
+    # "3400930179734",
+    # "3400926929992",
+    # "3400928022127",
+    # "3400930187050",
+    # "3400936757509",
+    # "3400936895744",
+    # "3400936424722",
+    # "3400930056202",
+    # "3400937746243",
+    # "3400930070604",
+    # "3400927623004",
+    # "3400930174968",
+    # "3400935651518",
+    # "3400932172146",
+    # "3400937680554",
+    # "3400934830167",
+    # "3400939536057",
+    # "3400930187159",
+    # "3400949335107",
+    # "3400930014066",
+    # "3400930014035",
+    # "3400930013984",
+    # "3400930013953",
+    # "3400936005167",
+    # "3400938307658",
+    # "3400930079782",
+    # "3400931710509",
+    # "3400936215993",
 ]
 
 
@@ -481,12 +481,16 @@ def availability_from_item(item):
     dispo = item.get("disponibilite") or {}
     livrable = parse_number(item.get("quantiteLivrable"))
     commandable = bool(dispo.get("commandable"))
-    in_stock = commandable and livrable > 0
+    code = dispo.get("code")
+    message = dispo.get("message") or ""
+    interrupted = "interrompu" in message.lower()
+    in_stock = commandable and livrable > 0 and not interrupted
 
     return {
         "in_stock": in_stock,
+        "availability_interrupted": interrupted,
         "commandable": commandable,
-        "code": dispo.get("code"),
+        "code": code,
         "message": dispo.get("message"),
         "quantite_livrable": item.get("quantiteLivrable"),
         "quantite_livrable_max": item.get("quantiteLivrableMax"),
@@ -505,6 +509,7 @@ def check_availability_group(products, client, quantity):
         accept="*/*",
         referer=referer,
     )
+    print(data)
     if not isinstance(data, list) or not data:
         raise RuntimeError(f"Reponse disponibilite inattendue: {data!r}")
 
