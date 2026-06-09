@@ -24,6 +24,7 @@ PARIS_TZ = ZoneInfo("Europe/Paris")
 QUIET_START_HOUR = 0
 QUIET_END_HOUR = 6
 WATCH_CIPS = [
+    "3400926630126",
     "3400926630294",
     "3400930179734",
     "3400926929992",
@@ -31,27 +32,26 @@ WATCH_CIPS = [
     "3400930187050",
     "3400936757509",
     "3400936895744",
-    "3400936424722",
-    "3400930056202",
-    "3400937746243",
     "3400930070604",
     "3400927623004",
     "3400930174968",
     "3400935651518",
+    "3400930125533",
     "3400932172146",
     "3400937680554",
-    "3400934830167",
-    "3400939536057",
+    "3400927943232",
+    "3400930022689",
     "3400930187159",
     "3400949335107",
     "3400930014066",
     "3400930014035",
     "3400930013984",
     "3400930013953",
+    "3400934069550",
     "3400936005167",
     "3400938307658",
-    "3400930079782",
     "3400931710509",
+    "3400949753079",
     "3400936215993",
 ]
 
@@ -371,9 +371,9 @@ def email_config():
     from_addr = os.environ.get("EMAIL_FROM") or os.environ.get("MAIL_FROM")
     if not from_addr and user and "@" in user:
         from_addr = user
-    to_addr = os.environ.get("EMAIL_TO") or from_addr
+    to_addrs = parse_email_list(os.environ.get("EMAIL_TO")) or [from_addr]
 
-    if not host or not from_addr or not to_addr:
+    if not host or not from_addr or not to_addrs:
         return None
 
     return {
@@ -382,30 +382,38 @@ def email_config():
         "user": user,
         "password": password,
         "from_addr": from_addr,
-        "to_addr": to_addr,
+        "to_addrs": to_addrs,
         "use_ssl": os.environ.get("SMTP_SSL", "").lower() in ("1", "true", "yes"),
         "use_tls": os.environ.get("SMTP_TLS", "1").lower() not in ("0", "false", "no"),
     }
 
 
+def parse_email_list(value):
+    if not value:
+        return []
+
+    normalized = value.replace(";", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
 def send_email(config, subject, body):
     message = EmailMessage()
     message["From"] = config["from_addr"]
-    message["To"] = config["to_addr"]
+    message["To"] = ", ".join(config["to_addrs"])
     message["Subject"] = subject
     message.set_content(body)
 
     if config["use_ssl"]:
         with smtplib.SMTP_SSL(config["host"], config["port"], timeout=30) as smtp:
             login_smtp(smtp, config)
-            smtp.send_message(message)
+            smtp.send_message(message, to_addrs=config["to_addrs"])
         return
 
     with smtplib.SMTP(config["host"], config["port"], timeout=30) as smtp:
         if config["use_tls"]:
             smtp.starttls()
         login_smtp(smtp, config)
-        smtp.send_message(message)
+        smtp.send_message(message, to_addrs=config["to_addrs"])
 
 
 def login_smtp(smtp, config):
@@ -662,7 +670,7 @@ def maybe_notify(product, availability, notify_state, notify_config, notify_enab
         "checkedAt": datetime.now().isoformat(timespec="seconds"),
         "lastNotifiedAt": datetime.now().isoformat(timespec="seconds"),
     }
-    print(f"Mail envoye pour {cip} -> {notify_config['to_addr']}", flush=True)
+    print(f"Mail envoye pour {cip} -> {', '.join(notify_config['to_addrs'])}", flush=True)
 
 
 def get_product(cip, client, cache_path, refresh_cache):
