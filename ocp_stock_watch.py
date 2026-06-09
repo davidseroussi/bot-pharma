@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import HTTPCookieProcessor, HTTPRedirectHandler, Request, build_opener, urlopen
+from zoneinfo import ZoneInfo
 
 
 BASE_URL = "https://www.ocp-pharmalia.fr"
@@ -19,6 +20,9 @@ HOME_URL = f"{BASE_URL}/ocp-pharmacien/"
 DEFAULT_CACHE = ".ocp-product-cache.json"
 DEFAULT_ENV = ".env"
 DEFAULT_NOTIFY_STATE = ".ocp-notification-state.json"
+PARIS_TZ = ZoneInfo("Europe/Paris")
+QUIET_START_HOUR = 0
+QUIET_END_HOUR = 6
 WATCH_CIPS = [
     "3400926630294",
     # "3400930179734",
@@ -54,6 +58,50 @@ WATCH_CIPS = [
 
 def now_ms():
     return int(time.time() * 1000)
+
+
+def paris_now():
+    return datetime.now(PARIS_TZ)
+
+
+def is_quiet_time(moment=None):
+    moment = moment or paris_now()
+    return QUIET_START_HOUR <= moment.hour < QUIET_END_HOUR
+
+
+def seconds_until_quiet_end(moment=None):
+    moment = moment or paris_now()
+    quiet_end = moment.replace(
+        hour=QUIET_END_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if moment >= quiet_end:
+        return 0
+    return max(1, int((quiet_end - moment).total_seconds()))
+
+
+def wait_if_quiet_time(once=False):
+    if not is_quiet_time():
+        return False
+
+    seconds = seconds_until_quiet_end()
+    wake_at = paris_now().replace(
+        hour=QUIET_END_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    print(
+        f"Pause nocturne Europe/Paris: pas de requete OCP avant {wake_at.strftime('%H:%M')}.",
+        flush=True,
+    )
+    if once:
+        return True
+
+    time.sleep(seconds)
+    return True
 
 
 def load_dotenv(path):
@@ -747,6 +795,11 @@ def main():
         action="store_true",
         help="Desactive la tentative de refresh OAuth automatique apres un 401.",
     )
+    parser.add_argument(
+        "--ignore-quiet-hours",
+        action="store_true",
+        help="Autorise les requetes entre minuit et 6h Europe/Paris.",
+    )
     args = parser.parse_args()
 
     input_cips = args.cip or WATCH_CIPS
@@ -775,11 +828,19 @@ def main():
     notify_config = email_config()
     client = OcpClient(cookie_header, env_path=args.env, auto_refresh=not args.no_refresh)
     try:
+        if not args.ignore_quiet_hours and wait_if_quiet_time(once=args.once):
+            if args.once:
+                return 0
+
         products = load_products(cips, client, cache_path, args.refresh_cache)
         if not products:
             return 1
 
         while True:
+            if not args.ignore_quiet_hours and wait_if_quiet_time(once=args.once):
+                if args.once:
+                    return 0
+
             ok = check_products(
                 products,
                 client,
