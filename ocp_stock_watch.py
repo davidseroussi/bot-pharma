@@ -529,7 +529,7 @@ def availability_url(products, quantity):
     marque = quote(products[0]["marque"], safe="")
     return (
         f"{BASE_URL}/ocp-back/produit/{ids}/disponibilite/"
-        f"{quantity}/{canal}/{marque}//resultat-recherche?_={now_ms()}"
+        f"{quantity}/{canal}/{marque}/no-offre/resultat-recherche?_={now_ms()}"
     )
 
 
