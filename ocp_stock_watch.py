@@ -620,6 +620,7 @@ def notification_body(product, availability):
             "",
             f"CIP: {product.get('cip')}",
             f"Nom: {product.get('nom')}",
+            f"Lien: {BASE_URL}/ocp-pharmacien/fiche-produit/{product.get('id')}",
             f"Code disponibilite: {availability.get('code')}",
             f"Message: {availability.get('message')}",
             f"Quantite livrable: {availability.get('quantite_livrable')}",
